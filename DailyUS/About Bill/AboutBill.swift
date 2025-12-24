@@ -22,7 +22,7 @@ struct AboutBill: View {
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
             // 背景放最底層
-            Background()
+            BackgroundBill()
             // 標題與右下角文字放在最上層
             Title()
                 .offset(x: 40)

@@ -26,8 +26,8 @@ struct InteractDashboardView: View {
                         HeartTapView()
                     } label: {
                         tile(
-                            title: "愛心",
-                            subtitle: "傳遞暖心小互動",
+                            title: "傳遞愛心",
+                            subtitle: "點燃我的心",
                             systemImage: "heart.fill",
                             tint: .pink
                         )
@@ -38,7 +38,7 @@ struct InteractDashboardView: View {
                         WeeklyQuizView()
                     } label: {
                         tile(
-                            title: "默契",
+                            title: "默契考驗",
                             subtitle: "小遊戲測默契",
                             systemImage: "hands.clap.fill",
                             tint: .purple

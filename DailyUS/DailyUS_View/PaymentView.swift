@@ -9,6 +9,26 @@ import SwiftUI
 import UserNotifications
 import Charts
 
+// 安全載入背景：若圖片資源缺失，退回為透明色，避免因資源缺漏崩潰
+@ViewBuilder
+private func safeBackground(named name: String) -> some View {
+    if UIImage(named: name) != nil {
+        Background(image: Image(name))
+            .opacity(0.5)
+            .allowsHitTesting(false)
+    } else {
+        Color.clear
+            .opacity(0.0)
+            .allowsHitTesting(false)
+    }
+}
+
+#if DEBUG
+private let isPreview: Bool = {
+    ProcessInfo.processInfo.environment["XCODE_RUNNING_FOR_PREVIEWS"] == "1"
+}()
+#endif
+
 // MARK: - Models
 
 enum PaymentCategory: String, CaseIterable, Identifiable, Codable {
@@ -45,7 +65,7 @@ struct PaymentRecord: Identifiable, Codable, Hashable {
     let id: UUID
     var date: Date
     var amount: Double
-    var payer: String // 例如「我」「對方」或名字
+    var payer: String
 
     init(id: UUID = UUID(), date: Date = Date(), amount: Double, payer: String) {
         self.id = id
@@ -60,12 +80,10 @@ struct PaymentItem: Identifiable, Codable, Hashable {
     var name: String
     var category: PaymentCategory
 
-    // 提醒設定
-    var dayOfMonth: Int            // 每月幾號（1...28，避免月底跨月問題）
-    var remindDaysBefore: Int      // 提前幾天提醒
-    var intervalMonths: Int        // 每幾個月一次（1=每月、2=雙月…）
+    var dayOfMonth: Int
+    var remindDaysBefore: Int
+    var intervalMonths: Int
 
-    // 歷史紀錄
     var records: [PaymentRecord]
 
     init(
@@ -85,31 +103,27 @@ struct PaymentItem: Identifiable, Codable, Hashable {
         self.intervalMonths = max(1, intervalMonths)
         self.records = records
     }
+
+    // O(n) 取得最後一筆（避免 sorted 重複計算）
+    var lastRecord: PaymentRecord? {
+        records.max(by: { $0.date < $1.date })
+    }
 }
 
-// MARK: - Simple JSON storage via AppStorage
+// MARK: - Storage
 
 private struct PaymentStorage {
     @AppStorage("payment_items_json") private var raw: String = ""
 
     func load() -> [PaymentItem] {
         guard let data = raw.data(using: .utf8), !raw.isEmpty else { return defaultItems() }
-        do {
-            return try JSONDecoder().decode([PaymentItem].self, from: data)
-        } catch {
-            return defaultItems()
-        }
+        return (try? JSONDecoder().decode([PaymentItem].self, from: data)) ?? defaultItems()
     }
 
     func save(_ items: [PaymentItem]) {
-        do {
-            let data = try JSONEncoder().encode(items)
-            if let s = String(data: data, encoding: .utf8) {
-                raw = s
-            }
-        } catch {
-            // ignore
-        }
+        guard let data = try? JSONEncoder().encode(items),
+              let s = String(data: data, encoding: .utf8) else { return }
+        raw = s
     }
 
     private func defaultItems() -> [PaymentItem] {
@@ -117,7 +131,7 @@ private struct PaymentStorage {
             PaymentItem(name: "水費", category: .water, dayOfMonth: 5, remindDaysBefore: 3, intervalMonths: 2),
             PaymentItem(name: "電費", category: .electricity, dayOfMonth: 10, remindDaysBefore: 3, intervalMonths: 2),
             PaymentItem(name: "瓦斯費", category: .gas, dayOfMonth: 12, remindDaysBefore: 2, intervalMonths: 1),
-            PaymentItem(name: "房租", category: .rent, dayOfMonth: 1, remindDaysBefore: 5, intervalMonths: 1)
+            PaymentItem(name: "房租", category: .rent, dayOfMonth: 21, remindDaysBefore: 5, intervalMonths: 1)
         ]
     }
 }
@@ -127,42 +141,28 @@ private struct PaymentStorage {
 actor PaymentNotifier {
     static let shared = PaymentNotifier()
 
-    func requestAuthorization() async -> Bool {
-        let center = UNUserNotificationCenter.current()
-        do {
-            let granted = try await center.requestAuthorization(options: [.alert, .sound, .badge])
-            return granted
-        } catch {
-            return false
-        }
+    func requestAuthorization() async {
+        _ = try? await UNUserNotificationCenter.current()
+            .requestAuthorization(options: [.alert, .sound, .badge])
     }
 
     func schedule(for item: PaymentItem) async {
         let center = UNUserNotificationCenter.current()
-        // 清除同 id 舊的排程
         await center.removePendingNotificationRequests(withIdentifiers: [item.id.uuidString])
-
-        // 計算下一次提醒日期（簡化：固定每月/每 n 個月的 dayOfMonth，提前 remindDaysBefore 天）
         guard let next = nextTriggerDate(day: item.dayOfMonth, monthsInterval: item.intervalMonths, daysBefore: item.remindDaysBefore) else { return }
 
         var comps = Calendar.current.dateComponents([.year, .month, .day], from: next)
-        comps.hour = 9 // 早上 9 點提醒，可視需求改 UI 設定
-
-        // 注意：UNCalendarNotificationTrigger 的 repeats 無法直接支援「每 n 個月」此類間隔。
-        // 這裡示範使用 repeats: true（每年同月日），實務上建議 repeats: false 並在 app 啟動或進入頁面時重新計算下一次排程。
-        let trigger = UNCalendarNotificationTrigger(dateMatching: comps, repeats: true)
+        comps.hour = 9
+        // 為避免系統 repeats 限制與錯誤重複，使用 repeats: false，並在每次進入頁面時重新排程
+        let trigger = UNCalendarNotificationTrigger(dateMatching: comps, repeats: false)
 
         let content = UNMutableNotificationContent()
         content.title = "繳費提醒：\(item.name)"
-        content.body = "快到繳費日囉（每 \(item.intervalMonths) 個月的 \(item.dayOfMonth) 號），別忘了！"
+        content.body = "每 \(item.intervalMonths) 個月的 \(item.dayOfMonth) 號，提前 \(item.remindDaysBefore) 天提醒"
         content.sound = .default
 
         let req = UNNotificationRequest(identifier: item.id.uuidString, content: content, trigger: trigger)
-        do {
-            try await center.add(req)
-        } catch {
-            // ignore
-        }
+        try? await center.add(req)
     }
 
     private func nextTriggerDate(day: Int, monthsInterval: Int, daysBefore: Int) -> Date? {
@@ -185,64 +185,117 @@ struct PaymentView: View {
     private let storage = PaymentStorage()
 
     @State private var showingAdd = false
+    @State private var showAddSingleSheet = false
+
+    // 新增單一項目暫存
+    @State private var singleName: String = ""
+    @State private var singleCategory: PaymentCategory = .other
+    @State private var singleAmount: String = ""
+    @State private var singlePayer: String = ""
+    @State private var singleDate: Date = Date()
+
+    @State private var showBackground: Bool = false
 
     var body: some View {
-        List {
-            Section {
-                ForEach(items) { item in
-                    NavigationLink {
-                        PaymentDetailView(item: item) { updated in
-                            updateItem(updated)
-                        } onDelete: {
-                            deleteItem(item)
-                        }
-                    } label: {
-                        HStack(spacing: 12) {
-                            Image(systemName: item.category.symbol)
-                                .foregroundStyle(item.category.color)
-                                .frame(width: 24)
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(item.name)
-                                    .font(.headline)
-                                Text("每 \(item.intervalMonths) 個月的 \(item.dayOfMonth) 號 · 提前 \(item.remindDaysBefore) 天提醒")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            if let last = item.records.sorted(by: { $0.date > $1.date }).first {
-                                Text(String(format: "$%.0f", last.amount))
-                                    .font(.subheadline.weight(.semibold))
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    }
+        ZStack {
+            if showBackground {
+                #if DEBUG
+                if isPreview {
+                    LinearGradient(colors: [.clear, .clear], startPoint: .top, endPoint: .bottom)
+                        .opacity(0.5)
+                        .allowsHitTesting(false)
+                } else {
+                    safeBackground(named: "Back_3")
                 }
-                .onDelete(perform: remove)
-            } header: {
-                Text("繳費提醒 / 記帳紀錄")
+                #else
+                safeBackground(named: "Back_3")
+                #endif
             }
 
-            Section {
-                Button {
-                    showingAdd = true
-                } label: {
-                    Label("新增項目", systemImage: "plus.circle.fill")
+            List {
+                Section {
+                    ForEach(items) { item in
+                        NavigationLink {
+                            PaymentDetailView(item: item) { updated in
+                                updateItem(updated)
+                            } onDelete: {
+                                deleteItem(item)
+                            }
+                        } label: {
+                            PaymentRow(item: item)
+                        }
+                    }
+                    .onDelete(perform: remove)
+                } header: {
+                    Text("繳費提醒 / 記帳紀錄")
+                }
+
+                Section {
+                    Button {
+                        showingAdd = true
+                    } label: {
+                        Label("新增固定項目", systemImage: "plus.circle.fill")
+                    }
+                }
+
+                Section("新增單一項目") {
+                    Button {
+                        singleName = ""
+                        singleCategory = .other
+                        singleAmount = ""
+                        singlePayer = ""
+                        singleDate = Date()
+                        showAddSingleSheet = true
+                    } label: {
+                        Label("新增單一項目", systemImage: "plus.circle.fill")
+                    }
                 }
             }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+            .padding(.top, 16)
+            .safeAreaInset(edge: .top) { Color.clear.frame(height: 8) }
         }
         .navigationTitle("繳費與記帳")
         .onAppear {
             items = storage.load()
-        }
-        .sheet(isPresented: $showingAdd) {
-            NavigationStack {
-                PaymentEditView(item: PaymentItem(name: "", category: .other)) { newItem in
-                    addItem(newItem)
-                } onCancel: { showingAdd = false }
+            // 直接顯示背景，避免淡入動畫造成首幀卡頓
+            showBackground = true
+
+            #if DEBUG
+            if isPreview {
+                // 預覽模式：使用少量假資料，避免通知與 I/O
+                items = [
+                    PaymentItem(name: "水費", category: .water),
+                    PaymentItem(name: "電費", category: .electricity)
+                ]
+                return
+            }
+            #endif
+
+            Task { await PaymentNotifier.shared.requestAuthorization() }
+            // 輕量地重新排程提醒（避免重覆排程可用去重策略）
+            Task {
+                for item in items {
+                    await PaymentNotifier.shared.schedule(for: item)
+                }
             }
         }
-        .task {
-            _ = await PaymentNotifier.shared.requestAuthorization()
+        .sheet(isPresented: $showingAdd) {
+            PaymentEditView(item: PaymentItem(name: "", category: .other)) { newItem in
+                addItem(newItem)
+            } onCancel: { showingAdd = false }
+        }
+        .sheet(isPresented: $showAddSingleSheet) {
+            SinglePaymentFormView(
+                name: $singleName,
+                category: $singleCategory,
+                amount: $singleAmount,
+                payer: $singlePayer,
+                date: $singleDate,
+                onCancel: { showAddSingleSheet = false },
+                onSave: { saveSingleFromSheet() }
+            )
         }
     }
 
@@ -268,18 +321,65 @@ struct PaymentView: View {
     private func deleteItem(_ item: PaymentItem) {
         items.removeAll { $0.id == item.id }
         storage.save(items)
-        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [item.id.uuidString])
+        UNUserNotificationCenter.current()
+            .removePendingNotificationRequests(withIdentifiers: [item.id.uuidString])
     }
 
     private func remove(at offsets: IndexSet) {
         let removed = offsets.map { items[$0] }
         items.remove(atOffsets: offsets)
         storage.save(items)
-        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: removed.map { $0.id.uuidString })
+        UNUserNotificationCenter.current()
+            .removePendingNotificationRequests(withIdentifiers: removed.map { $0.id.uuidString })
+    }
+
+    private func saveSingleFromSheet() {
+        guard let amount = Double(singleAmount) else { return }
+        var name = singleName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if name.isEmpty { name = singleCategory.rawValue }
+
+        let record = PaymentRecord(date: singleDate, amount: amount, payer: singlePayer)
+        let oneOff = PaymentItem(
+            name: name,
+            category: singleCategory,
+            dayOfMonth: 1,
+            remindDaysBefore: 0,
+            intervalMonths: 1,
+            records: [record]
+        )
+        items.append(oneOff)
+        storage.save(items)
+        showAddSingleSheet = false
     }
 }
 
-// MARK: - Detail view
+// MARK: - Lightweight row (避免在 label 內做排序)
+
+private struct PaymentRow: View {
+    let item: PaymentItem
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: item.category.symbol)
+                .foregroundStyle(item.category.color)
+                .frame(width: 24)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(item.name).font(.headline)
+                Text("每 \(item.intervalMonths) 個月的 \(item.dayOfMonth) 號 · 提前 \(item.remindDaysBefore) 天提醒")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if let last = item.lastRecord {
+                Text(String(format: "$%.0f", last.amount))
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+// MARK: - Detail view（排序只做一次）
 
 struct PaymentDetailView: View {
     @State var item: PaymentItem
@@ -291,124 +391,176 @@ struct PaymentDetailView: View {
     @State private var newPayer: String = ""
     @State private var newDate: Date = Date()
 
+    @State private var editTargetRecord: PaymentRecord?
+    @State private var showEditRecordSheet: Bool = false
+
     var body: some View {
-        List {
-            Section("設定") {
-                HStack {
-                    Text("名稱")
-                    Spacer()
-                    Text(item.name).foregroundStyle(.secondary)
-                }
-                HStack {
-                    Text("類別")
-                    Spacer()
-                    Label(item.category.rawValue, systemImage: item.category.symbol)
-                        .labelStyle(.titleAndIcon)
-                        .foregroundStyle(.secondary)
-                }
-                HStack {
-                    Text("每幾個月")
-                    Spacer()
-                    Text("\(item.intervalMonths) 個月").foregroundStyle(.secondary)
-                }
-                HStack {
-                    Text("每月日子")
-                    Spacer()
-                    Text("\(item.dayOfMonth) 號").foregroundStyle(.secondary)
-                }
-                HStack {
-                    Text("提前提醒")
-                    Spacer()
-                    Text("\(item.remindDaysBefore) 天").foregroundStyle(.secondary)
-                }
-                Button {
-                    showingEdit = true
-                } label: {
-                    Label("修改設定", systemImage: "pencil")
-                }
+        ZStack {
+            #if DEBUG
+            if isPreview {
+                LinearGradient(colors: [.clear, .clear], startPoint: .top, endPoint: .bottom)
+                    .opacity(0.5)
+                    .allowsHitTesting(false)
+            } else {
+                safeBackground(named: "Back_4")
             }
+            #else
+            safeBackground(named: "Back_4")
+            #endif
 
-            Section("新增本期費用") {
-                HStack {
-                    Text("金額")
-                    TextField("0", text: $newAmount)
-                        .keyboardType(.decimalPad)
-                        .multilineTextAlignment(.trailing)
-                }
-                HStack {
-                    Text("付款人")
-                    TextField("例如 我 / 對方 / 名字", text: $newPayer)
-                        .multilineTextAlignment(.trailing)
-                }
-                DatePicker("日期", selection: $newDate, displayedComponents: .date)
-
-                Button {
-                    addRecord()
-                } label: {
-                    Label("加入紀錄", systemImage: "plus.circle.fill")
-                }
-                .disabled(Double(newAmount) == nil || newPayer.trimmingCharacters(in: .whitespaces).isEmpty)
-            }
-
-            if !item.records.isEmpty {
-                Section("歷史紀錄") {
-                    ForEach(item.records.sorted(by: { $0.date > $1.date })) { r in
-                        HStack {
-                            VStack(alignment: .leading) {
-                                Text(r.date.formatted(date: .abbreviated, time: .omitted))
-                                    .font(.subheadline.weight(.semibold))
-                                Text(r.payer)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Text(String(format: "$%.0f", r.amount))
-                                .font(.headline)
-                        }
+            List {
+                Section("設定") {
+                    displayRow("名稱", value: item.name)
+                    displayRow("類別", value: item.category.rawValue, symbol: item.category.symbol)
+                    displayRow("每幾個月", value: "\(item.intervalMonths) 個月")
+                    displayRow("每月日子", value: "\(item.dayOfMonth) 號")
+                    displayRow("提前提醒", value: "\(item.remindDaysBefore) 天")
+                    Button { showingEdit = true } label: {
+                        Label("修改設定", systemImage: "pencil")
                     }
                 }
 
-                Section("消費分析（依付款人）") {
-                    PaymentPieChart(records: item.records)
-                        .frame(height: 220)
+                Section("新增本期費用") {
+                    HStack {
+                        Text("金額")
+                        TextField("0", text: $newAmount)
+                            .keyboardType(.decimalPad)
+                            .multilineTextAlignment(.trailing)
+                    }
+                    HStack {
+                        Text("付款人")
+                        TextField("例如 我 / 對方 / 名字", text: $newPayer)
+                            .multilineTextAlignment(.trailing)
+                    }
+                    DatePicker("日期", selection: $newDate, displayedComponents: .date)
+
+                    Button {
+                        addRecord()
+                    } label: {
+                        Label("加入紀錄", systemImage: "plus.circle.fill")
+                    }
+                    .disabled(Double(newAmount) == nil || newPayer.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+
+                if !item.records.isEmpty {
+                    Section("歷史紀錄") {
+                        let sorted = item.records.sorted(by: { $0.date > $1.date })
+                        ForEach(sorted, id: \.id) { r in
+                            Button {
+                                editTargetRecord = r
+                                showEditRecordSheet = true
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading) {
+                                        Text(r.date.formatted(date: .abbreviated, time: .omitted))
+                                            .font(.subheadline.weight(.semibold))
+                                        Text(r.payer)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    Text(String(format: "$%.0f", r.amount))
+                                        .font(.headline)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            .contextMenu {
+                                Button(role: .destructive) { deleteRecord(r) } label: {
+                                    Label("刪除此筆", systemImage: "trash")
+                                }
+                            }
+                        }
+                        .onDelete { indexSet in
+                            let sorted = item.records.sorted(by: { $0.date > $1.date })
+                            let ids = indexSet.compactMap { $0 < sorted.count ? sorted[$0].id : nil }
+                            item.records.removeAll { ids.contains($0.id) }
+                            onSave(item)
+                        }
+                    }
+
+                    Section("消費分析（依付款人）") {
+                        if #available(iOS 16.0, *) {
+                            PaymentPieChart(records: item.records)
+                                .frame(height: 220)
+                        } else {
+                            Text("需要 iOS 16 以上才能顯示圖表")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 }
             }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+            .padding(.top, 16)
+            .safeAreaInset(edge: .top) { Color.clear.frame(height: 8) }
         }
         .navigationTitle(item.name)
         .sheet(isPresented: $showingEdit) {
-            NavigationStack {
-                PaymentEditView(item: item) { updated in
-                    item = updated
-                    onSave(updated)
-                    showingEdit = false
-                } onCancel: {
-                    showingEdit = false
-                }
+            PaymentEditView(item: item) { updated in
+                item = updated
+                onSave(updated)
+                showingEdit = false
+            } onCancel: { showingEdit = false }
+        }
+        .sheet(isPresented: $showEditRecordSheet) {
+            if let target = editTargetRecord {
+                RecordEditView(
+                    record: target,
+                    onCancel: { showEditRecordSheet = false },
+                    onSave: { updated in
+                        applyEditedRecord(updated)
+                        showEditRecordSheet = false
+                    },
+                    onDelete: {
+                        deleteRecord(target)
+                        showEditRecordSheet = false
+                    }
+                )
             }
         }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
-                    Button(role: .destructive) {
-                        onDelete()
-                    } label: {
+                    Button(role: .destructive) { onDelete() } label: {
                         Label("刪除項目", systemImage: "trash")
                     }
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                }
+                } label: { Image(systemName: "ellipsis.circle") }
+            }
+        }
+    }
+
+    private func displayRow(_ title: String, value: String, symbol: String? = nil) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            if let symbol {
+                Label(value, systemImage: symbol).foregroundStyle(.secondary)
+            } else {
+                Text(value).foregroundStyle(.secondary)
             }
         }
     }
 
     private func addRecord() {
         guard let amount = Double(newAmount) else { return }
-        let rec = PaymentRecord(amount: amount, payer: newPayer, date: newDate)
+        let rec = PaymentRecord(date: newDate, amount: amount, payer: newPayer)
         item.records.append(rec)
         onSave(item)
         newAmount = ""
         newPayer = ""
         newDate = Date()
+    }
+
+    private func applyEditedRecord(_ updated: PaymentRecord) {
+        if let idx = item.records.firstIndex(where: { $0.id == updated.id }) {
+            item.records[idx] = updated
+            onSave(item)
+        }
+    }
+
+    private func deleteRecord(_ r: PaymentRecord) {
+        item.records.removeAll { $0.id == r.id }
+        onSave(item)
     }
 }
 
@@ -459,15 +611,81 @@ struct PaymentEditView: View {
     }
 }
 
-// MARK: - Pie chart
+// MARK: - Record edit sheet
+
+private struct RecordEditView: View {
+    @State var record: PaymentRecord
+    var onCancel: () -> Void
+    var onSave: (PaymentRecord) -> Void
+    var onDelete: () -> Void
+
+    @State private var amountText: String = ""
+    @State private var payerText: String = ""
+    @State private var dateValue: Date = Date()
+
+    private var canSave: Bool {
+        Double(amountText) != nil && !payerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    init(record: PaymentRecord, onCancel: @escaping () -> Void, onSave: @escaping (PaymentRecord) -> Void, onDelete: @escaping () -> Void) {
+        self._record = State(initialValue: record)
+        self.onCancel = onCancel
+        self.onSave = onSave
+        self.onDelete = onDelete
+        self._amountText = State(initialValue: String(format: "%.0f", record.amount))
+        self._payerText = State(initialValue: record.payer)
+        self._dateValue = State(initialValue: record.date)
+    }
+
+    var body: some View {
+        Form {
+            Section("紀錄內容") {
+                TextField("金額", text: $amountText).keyboardType(.decimalPad)
+                TextField("付款人", text: $payerText)
+                    .textInputAutocapitalization(.none)
+                    .autocorrectionDisabled()
+                DatePicker("日期", selection: $dateValue, displayedComponents: .date)
+            }
+
+            Section {
+                Button(role: .destructive) { onDelete() } label: {
+                    Label("刪除這筆紀錄", systemImage: "trash")
+                }
+            }
+        }
+        .navigationTitle("編輯紀錄")
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("取消") { onCancel() }
+            }
+            ToolbarItem(placement: .confirmationAction) {
+                Button("儲存") {
+                    guard let amount = Double(amountText) else { return }
+                    var updated = record
+                    updated.amount = amount
+                    updated.payer = payerText
+                    updated.date = dateValue
+                    onSave(updated)
+                }
+                .disabled(!canSave)
+            }
+        }
+    }
+}
+
+// MARK: - Pie chart（只在詳細頁使用，避免主頁負擔）
 
 struct PaymentPieChart: View {
     let records: [PaymentRecord]
 
     private var grouped: [(payer: String, total: Double)] {
-        let dict = Dictionary(grouping: records, by: { $0.payer })
-            .mapValues { $0.reduce(0) { $0 + $1.amount } }
-        return dict.map { ($0.key, $0.value) }.sorted { $0.total > $1.total }
+        // 單次 O(n) 彙總
+        var totals: [String: Double] = [:]
+        for r in records {
+            totals[r.payer, default: 0] += r.amount
+        }
+        return totals.map { ($0.key, $0.value) }
+            .sorted { $0.total > $1.total }
     }
 
     var body: some View {
@@ -490,8 +708,7 @@ struct PaymentPieChart: View {
         .chartLegend(.visible)
         .chartBackground { _ in
             if records.isEmpty {
-                Text("尚無資料")
-                    .foregroundStyle(.secondary)
+                Text("尚無資料").foregroundStyle(.secondary)
             }
         }
     }
@@ -500,3 +717,78 @@ struct PaymentPieChart: View {
         records.reduce(0) { $0 + $1.amount }
     }
 }
+
+#Preview("主畫面（輕量預覽）") {
+    NavigationStack {
+        PaymentView()
+    }
+}
+
+#Preview("詳細頁（假資料）") {
+    NavigationStack {
+        PaymentDetailView(
+            item: PaymentItem(
+                name: "電費",
+                category: .electricity,
+                records: [
+                    PaymentRecord(date: .now, amount: 800, payer: "我"),
+                    PaymentRecord(date: .now.addingTimeInterval(-86400*30), amount: 760, payer: "對方")
+                ]
+            ),
+            onSave: { _ in },
+            onDelete: {}
+        )
+    }
+}
+
+// MARK: - Single one-off payment form
+private struct SinglePaymentFormView: View {
+    @Binding var name: String
+    @Binding var category: PaymentCategory
+    @Binding var amount: String
+    @Binding var payer: String
+    @Binding var date: Date
+
+    var onCancel: () -> Void
+    var onSave: () -> Void
+
+    private var canSave: Bool {
+        // 名稱可留空，外層會以類別名稱代填；此處只驗證金額與付款人
+        Double(amount) != nil && !payer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("基本資訊") {
+                    TextField("名稱（可留空）", text: $name)
+                    Picker("類別", selection: $category) {
+                        ForEach(PaymentCategory.allCases) { cat in
+                            Label(cat.rawValue, systemImage: cat.symbol).tag(cat)
+                        }
+                    }
+                }
+
+                Section("紀錄內容") {
+                    TextField("金額", text: $amount)
+                        .keyboardType(.decimalPad)
+                    TextField("付款人", text: $payer)
+                        .textInputAutocapitalization(.none)
+                        .autocorrectionDisabled()
+                    DatePicker("日期", selection: $date, displayedComponents: .date)
+                }
+            }
+            .navigationTitle("新增單一項目")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { onCancel() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("儲存") { onSave() }
+                        .disabled(!canSave)
+                }
+            }
+        }
+    }
+}
+

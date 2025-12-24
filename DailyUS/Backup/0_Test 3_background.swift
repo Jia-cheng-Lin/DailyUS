@@ -4,10 +4,10 @@
 ////
 ////  Created by 林嘉誠 on 2025/12/2.
 ////
-///
-///
-///   先存檔作為備份
-///
+////
+////
+////   先存檔作為備份
+////
 //
 //import SwiftUI
 //
@@ -85,7 +85,7 @@
 //}
 //
 //// MARK: - Onboarding
-//struct OnboardingView: View {
+//struct OnboardingViewTests: View {
 //    @State private var name: String
 //    @State private var role: String
 //    @State private var selectedRoleIndex: Int = 0
@@ -202,24 +202,45 @@
 //struct HomeTabView: View {
 //    var body: some View {
 //        TabView {
-//            // Use the real DailyDashboardView from ⑤ DailyDashboardView.swift
-//            DailyDashboardView()
-//                .tabItem {
-//                    Label("Daily", systemImage: "sun.max")
+//            NavigationStack {
+//                ZStack {
+//                    Background(image: Image("Back_1"))
+//                    DailyDashboardView()
 //                }
-//            InteractDashboardView()
-//                .tabItem {
-//                    Label("Interact", systemImage: "heart")
+//            }
+//            .tabItem {
+//                Label("Daily", systemImage: "sun.max")
+//            }
+//
+//            NavigationStack {
+//                ZStack {
+//                    Background(image: Image("Back_5"))
+//                    InteractDashboardView()
 //                }
-//            // 使用正式檔案的 MemoryDashboardView（位於 ⑬ 檔案）
-//            MemoryDashboardView()
-//                .tabItem {
-//                    Label("Memory", systemImage: "clock.arrow.circlepath")
+//            }
+//            .tabItem {
+//                Label("Interact", systemImage: "heart")
+//            }
+//
+//            NavigationStack {
+//                ZStack {
+//                    Background(image: Image("Back_3"))
+//                    MemoryDashboardView()
 //                }
-//            ProfileView_Test()
-//                .tabItem {
-//                    Label("Profile", systemImage: "person.crop.circle")
+//            }
+//            .tabItem {
+//                Label("Memory", systemImage: "clock.arrow.circlepath")
+//            }
+//
+//            NavigationStack {
+//                ZStack {
+//                    Background(image: Image("Back_4"))
+//                    ProfileView()
 //                }
+//            }
+//            .tabItem {
+//                Label("Profile", systemImage: "person.crop.circle")
+//            }
 //        }
 //    }
 //}

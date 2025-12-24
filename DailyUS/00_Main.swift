@@ -10,11 +10,13 @@ import SwiftUI
 // Root view responsible for:
 // - Starting the app UI
 // - Managing AppStorage and (simulated) cloud loading state
-// - Deciding first screen: Onboarding or MainTabView
+// - Deciding first screen: Onboarding or HomeTabView
 struct Main: View {
 
     // Persist whether onboarding has been completed
     @AppStorage("hasCompletedOnboarding") private var hasCompletedOnboarding: Bool = false
+    @AppStorage("userName") private var userName: String = ""
+    @AppStorage("userRole") private var userRole: String = ""
 
     // Whether initial data is loading (e.g., cloud sync, configuration fetch)
     @State private var isLoading: Bool = true
@@ -40,13 +42,19 @@ struct Main: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 if hasCompletedOnboarding {
-                    // After onboarding completed
+                    // After onboarding completed → show the HomeTabView from 0_Test.swift
                     MainTabView()
                 } else {
-                    // Show onboarding and handle completion
-                    OnboardingView(onCompleted: {
-                        hasCompletedOnboarding = true
-                    })
+                    // Use the OnboardingView defined in 0_Test.swift
+                    OnboardingView(
+                        currentName: userName,
+                        currentRole: userRole,
+                        onCompleted: { name, role in
+                            userName = name
+                            userRole = role
+                            hasCompletedOnboarding = true
+                        }
+                    )
                 }
             }
         }
@@ -62,49 +70,11 @@ struct Main: View {
         loadingError = nil
         isLoading = true
         do {
-            // Replace with your real initialization logic:
-            // e.g., await CloudManager.shared.initialize()
-            try await Task.sleep(nanoseconds: 800_000_000) // ~0.8s simulated delay
-            // If you need to read a flag from cloud to override onboarding, do it here.
-            // Example:
-            // hasCompletedOnboarding = await CloudManager.shared.hasCompletedOnboarding
+            try await Task.sleep(nanoseconds: 800_000_000)
             isLoading = false
         } catch {
             loadingError = error.localizedDescription
             isLoading = true
-        }
-    }
-}
-
-// Placeholder for OnboardingView; implement this in your own file.
-// The onCompleted closure should be called when onboarding finishes.
-private struct OnboardingView: View {
-    var onCompleted: () -> Void
-    var body: some View {
-        VStack(spacing: 16) {
-            Text("Onboarding")
-                .font(.title)
-            Text("這裡是新手引導頁面。")
-            Button("完成") {
-                onCompleted()
-            }
-        }
-        .padding()
-    }
-}
-
-// Placeholder for MainTabView; implement your real tab structure elsewhere.
-private struct MainTabView: View {
-    var body: some View {
-        TabView {
-            TemplateUS()
-                .tabItem {
-                    Label("首頁", systemImage: "house")
-                }
-            User()
-                .tabItem {
-                    Label("使用者", systemImage: "person")
-                }
         }
     }
 }

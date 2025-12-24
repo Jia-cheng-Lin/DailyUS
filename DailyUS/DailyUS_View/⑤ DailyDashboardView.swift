@@ -121,8 +121,8 @@ struct DailyDashboardView: View {
                 MoodView()
             } label: {
                 tile(
-                    title: "心情",
-                    subtitle: "紀錄 0-10",
+                    title: "今日心情",
+                    subtitle: "今天心情如何",
                     systemImage: "face.smiling",
                     tint: .yellow
                 )
@@ -134,7 +134,7 @@ struct DailyDashboardView: View {
             } label: {
                 tile(
                     title: "今日問題",
-                    subtitle: "回答彼此",
+                    subtitle: "回答共同問題",
                     systemImage: "text.bubble",
                     tint: .blue
                 )
@@ -145,8 +145,8 @@ struct DailyDashboardView: View {
                 MessageView()
             } label: {
                 tile(
-                    title: "給對方訊息",
-                    subtitle: "傳達心意",
+                    title: "傳送訊息",
+                    subtitle: "傳達我的心意",
                     systemImage: "paperplane.fill",
                     tint: .green
                 )
@@ -158,7 +158,7 @@ struct DailyDashboardView: View {
             } label: {
                 tile(
                     title: "心靈小卡",
-                    subtitle: "抽張卡片",
+                    subtitle: "來抽張卡片吧",
                     systemImage: "sparkles",
                     tint: .purple
                 )

@@ -8,7 +8,7 @@
 import Foundation
 import SwiftUI
 
-struct Background: View {
+struct BackgroundBill: View {
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
@@ -44,5 +44,5 @@ struct Background: View {
 }
 
 #Preview {
-    Background()
+    BackgroundBill()
 }

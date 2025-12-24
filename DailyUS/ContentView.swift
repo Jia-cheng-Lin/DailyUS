@@ -2,23 +2,20 @@
 //  ContentView.swift
 //  DailyUS
 //
-//  Created by 陳芸萱 on 2025/12/2.
+//  Created by Your Name on 2025/12/3.
 //
 
 import SwiftUI
 
 struct ContentView: View {
     var body: some View {
-        VStack {
-            Image(systemName: "globe")
-                .imageScale(.large)
-                .foregroundStyle(.tint)
-            Text("Hello, world!")
-        }
-        .padding()
+        // Centralized app flow per your flow chart:
+        // Launch → Onboarding → Couple Pairing → Main Tabs (Daily / Interact / Memory / Profile)
+        TestRoot()
     }
 }
 
 #Preview {
     ContentView()
 }
+

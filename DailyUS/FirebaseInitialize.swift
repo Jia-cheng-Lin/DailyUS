@@ -3,7 +3,6 @@ import FirebaseCore
 import FirebaseFirestore
 
 enum FirestoreInitializer {
-    // 可選：用來驗證 Firestore 是否可讀寫
     static func firestoreSmokeTest() {
         let db = Firestore.firestore()
         db.collection("smokeTests").document("hello").setData([

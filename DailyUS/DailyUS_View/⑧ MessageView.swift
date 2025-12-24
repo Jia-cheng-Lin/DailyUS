@@ -10,6 +10,7 @@ import AVFoundation
 import Combine
 import FirebaseFirestore
 import FirebaseStorage
+import FoundationModels // 先行匯入，之後可替換為真正的 Foundation Models 呼叫
 
 // MARK: - Model
 struct MessageItem: Identifiable, Equatable {
@@ -288,15 +289,41 @@ final class AudioPlayer: ObservableObject {
     }
 }
 
+// MARK: - 簡單回覆器（可日後替換為真正的 Foundation Models 介面）
+protocol SimpleResponder {
+    func reply(to text: String) async -> String
+}
+
+struct LocalSimpleResponder: SimpleResponder {
+    func reply(to text: String) async -> String {
+        // 這裡先用最簡單的規則產生回覆（本地、無網路）
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "我在這裡喔～" }
+        if trimmed.contains("愛") { return "我也愛你！❤️😍～" }
+        if trimmed.count <= 6 { return "收到：「\(trimmed)」😊" }
+        if trimmed.contains("?") { return "好問題！我也想知道～" }
+        return "謝謝你的訊息：「\(trimmed)」"
+    }
+}
+
 // MARK: - View
 struct MessageView: View {
     // UI states
     @State private var text: String = ""
     @State private var isUploading: Bool = false
     @State private var uploadError: String?
+    @State private var uploadSuccessMessage: String?
 
     @State private var messages: [MessageItem] = []
+    @State private var localDrafts: [MessageItem] = [] // 本地顯示用，未上傳
     @State private var isLoadingHistory: Bool = true
+
+    @AppStorage("coupleID") private var coupleID: String = ""
+    @AppStorage("userID") private var userID: String = UUID().uuidString
+    @State private var listener: ListenerRegistration?
+
+    // Added FocusState for the text field
+    @FocusState private var isTextFieldFocused: Bool
 
     // Recording
     @StateObject private var recorder = AudioRecorder()
@@ -305,9 +332,12 @@ struct MessageView: View {
     // Animations & accessibility
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var pulse: Bool = false
+    @State private var useAI: Bool = true
 
     // Uploader（Firestore + Storage）
     private let uploader: MessageUploading = FirestoreMessageUploader()
+    // 簡單回覆器（目前為本地；未來可替換為用 Foundation Models 的版本）
+    private let responder: SimpleResponder = LocalSimpleResponder()
 
     var body: some View {
         ZStack {
@@ -319,19 +349,51 @@ struct MessageView: View {
             VStack(spacing: 12) {
                 header
                 historyList
+                // 把底部整塊內容往上一點（調整數值大小即可）
                 inputArea
+                    .padding(.top, -180)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
+            
+            // 成功提示橫幅
+            if let success = uploadSuccessMessage {
+                VStack {
+                    Spacer()
+                    HStack {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.white)
+                        Text(success)
+                            .foregroundStyle(.white)
+                            .font(.subheadline)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(.green.opacity(0.9))
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 20)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+                .animation(.easeInOut(duration: 0.25), value: uploadSuccessMessage)
+            }
         }
         .navigationTitle("傳訊息")
         .navigationBarTitleDisplayMode(.inline)
-        .task {
-            await loadHistory()
-        }
         .onAppear {
             if !reduceMotion { pulse = true }
+            subscribeRealtime()
+            isLoadingHistory = true
         }
+        .onDisappear {
+            stopRealtime()
+        }
+        .gesture(
+            TapGesture().onEnded { isTextFieldFocused = false }
+        )
     }
 
     // MARK: - Header
@@ -354,6 +416,15 @@ struct MessageView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            VStack(spacing: 4) {
+                Text("AI 功能")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Toggle("AI 功能", isOn: $useAI)
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                    .accessibilityLabel("AI 功能")
+            }
             if isLoadingHistory {
                 ProgressView()
             }
@@ -363,10 +434,10 @@ struct MessageView: View {
     // MARK: - History
     private var historyList: some View {
         Group {
-            if messages.isEmpty {
+            if messages.isEmpty && localDrafts.isEmpty {
                 VStack(spacing: 8) {
                     if isLoadingHistory {
-                        EmptyView()
+                        ProgressView()
                     } else {
                         Text("尚無訊息")
                             .foregroundStyle(.secondary)
@@ -375,9 +446,19 @@ struct MessageView: View {
                 .frame(maxWidth: .infinity, minHeight: 160)
             } else {
                 List {
+                    // 先顯示本地草稿（我的藍色訊息，未上傳）
+                    ForEach(localDrafts) { item in
+                        MessageRow(item: item, player: player)
+                            .listRowSeparator(.hidden)
+                            .listRowBackground(Color.clear)
+                            .listRowInsets(EdgeInsets())
+                    }
+                    // 再顯示雲端訊息
                     ForEach(messages) { item in
                         MessageRow(item: item, player: player)
                             .listRowSeparator(.hidden)
+                            .listRowBackground(Color.clear)
+                            .listRowInsets(EdgeInsets()) // 移除預設內距，讓右側能貼齊
                     }
                 }
                 .listStyle(.plain)
@@ -395,19 +476,44 @@ struct MessageView: View {
                 TextField("輸入文字訊息…", text: $text, axis: .vertical)
                     .lineLimit(3, reservesSpace: true)
                     .textFieldStyle(.roundedBorder)
+                    .focused($isTextFieldFocused)
 
                 Button {
-                    Task { await sendText() }
+                    isTextFieldFocused = false
                 } label: {
-                    if isUploading {
-                        ProgressView().scaleEffect(0.9)
-                    } else {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.system(size: 26))
-                    }
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 20))
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityLabel("關閉鍵盤")
+
+                Button {
+                    Task { addLocalDraft() }
+                } label: {
+                    Image(systemName: "paperplane.fill")
+                        .font(.system(size: 22))
                 }
                 .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isUploading)
-                .accessibilityLabel("送出文字")
+                .accessibilityLabel("新增本地草稿")
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    Task { await uploadLatestDraft() }
+                } label: {
+                    HStack(spacing: 6) {
+                        if isUploading {
+                            ProgressView().scaleEffect(0.9)
+                        } else {
+                            Image(systemName: "icloud.and.arrow.up.fill")
+                            Text("上傳雲端")
+                        }
+                    }
+                    .font(.system(size: 16, weight: .semibold))
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(localDrafts.isEmpty || isUploading)
+                Spacer()
             }
 
             HStack(spacing: 12) {
@@ -446,6 +552,72 @@ struct MessageView: View {
     }
 
     // MARK: - Actions
+    private func subscribeRealtime() {
+        guard !coupleID.isEmpty else { return }
+        let db = Firestore.firestore()
+        let query = db.collection("messages")
+            .whereField("coupleID", isEqualTo: coupleID)
+            .order(by: "createdAt", descending: true)
+            .limit(to: 50)
+
+        listener = query.addSnapshotListener { snapshot, error in
+            if let error {
+                DispatchQueue.main.async {
+                    self.uploadError = (error as NSError).localizedDescription
+                    self.isLoadingHistory = false
+                }
+                return
+            }
+            guard let snapshot else { return }
+            let items: [MessageItem] = snapshot.documents.compactMap { doc in
+                let data = doc.data()
+                let fromUser = data["fromUserID"] as? String ?? ""
+                let sender = (fromUser == userID) ? "me" : "partner"
+
+                #if DEBUG
+                print("[MessageView] recv fromUserID=\(fromUser) localUserID=\(userID) => sender=\(sender)")
+                #endif
+
+                let date: Date
+                if let d = data["createdAt"] as? Date {
+                    date = d
+                } else if let ts = data["createdAt"] as? Timestamp {
+                    date = ts.dateValue()
+                } else if
+                    let tsObj = data["createdAt"] as? NSObject,
+                    let d = tsObj.value(forKey: "dateValue") as? Date {
+                    date = d
+                } else {
+                    date = Date()
+                }
+
+                let type = (data["type"] as? String) ?? (data["text"] != nil ? "text" : "audio")
+                if type == "text" {
+                    guard let text = data["text"] as? String else { return nil }
+                    return MessageItem(id: UUID(), date: date, sender: sender, kind: .text(text))
+                } else if type == "audio" {
+                    guard
+                        let urlStr = data["audioURL"] as? String,
+                        let remoteURL = URL(string: urlStr)
+                    else { return nil }
+                    let duration = (data["duration"] as? Double) ?? 0
+                    return MessageItem(id: UUID(), date: date, sender: sender, kind: .audio(remoteURL, duration: duration))
+                } else {
+                    return nil
+                }
+            }
+            DispatchQueue.main.async {
+                self.messages = items
+                self.isLoadingHistory = false
+            }
+        }
+    }
+
+    private func stopRealtime() {
+        listener?.remove()
+        listener = nil
+    }
+
     @MainActor
     private func loadHistory() async {
         isLoadingHistory = true
@@ -460,16 +632,149 @@ struct MessageView: View {
     }
 
     @MainActor
+    private func loadPartnerMessages() async {
+        guard !coupleID.isEmpty else { return }
+        isLoadingHistory = true
+        let db = Firestore.firestore()
+        let query = db.collection("messages")
+            .whereField("coupleID", isEqualTo: coupleID)
+            .order(by: "createdAt", descending: true)
+            .limit(to: 50)
+        do {
+            let snap = try await query.getDocuments()
+            let allItems: [MessageItem] = snap.documents.compactMap { doc in
+                let data = doc.data()
+                let fromUser = data["fromUserID"] as? String ?? ""
+                let sender = (fromUser == userID) ? "me" : "partner"
+
+                #if DEBUG
+                print("[MessageView] recv fromUserID=\(fromUser) localUserID=\(userID) => sender=\(sender)")
+                #endif
+
+                let date: Date
+                if let d = data["createdAt"] as? Date {
+                    date = d
+                } else if let ts = data["createdAt"] as? Timestamp {
+                    date = ts.dateValue()
+                } else if
+                    let tsObj = data["createdAt"] as? NSObject,
+                    let d = tsObj.value(forKey: "dateValue") as? Date {
+                    date = d
+                } else {
+                    date = Date()
+                }
+
+                let type = (data["type"] as? String) ?? (data["text"] != nil ? "text" : "audio")
+                if type == "text" {
+                    guard let text = data["text"] as? String else { return nil }
+                    return MessageItem(id: UUID(), date: date, sender: sender, kind: .text(text))
+                } else if type == "audio" {
+                    guard
+                        let urlStr = data["audioURL"] as? String,
+                        let remoteURL = URL(string: urlStr)
+                    else { return nil }
+                    let duration = (data["duration"] as? Double) ?? 0
+                    return MessageItem(id: UUID(), date: date, sender: sender, kind: .audio(remoteURL, duration: duration))
+                } else {
+                    return nil
+                }
+            }
+            let partnerItems = allItems.filter { $0.sender != "me" }
+            self.messages = partnerItems
+            self.isLoadingHistory = false
+        } catch {
+            self.isLoadingHistory = false
+            self.uploadError = localizedFirestoreError(error)
+        }
+    }
+
+    @MainActor
+    private func loadAllMessagesForCouple() async {
+        guard !coupleID.isEmpty else { return }
+        isLoadingHistory = true
+        let db = Firestore.firestore()
+        let query = db.collection("messages")
+            .whereField("coupleID", isEqualTo: coupleID)
+            .order(by: "createdAt", descending: true)
+            .limit(to: 50)
+        do {
+            let snap = try await query.getDocuments()
+            let items: [MessageItem] = snap.documents.compactMap { doc in
+                let data = doc.data()
+                let fromUser = data["fromUserID"] as? String ?? ""
+                let sender = (fromUser == userID) ? "me" : "partner"
+
+                #if DEBUG
+                print("[MessageView] recv fromUserID=\(fromUser) localUserID=\(userID) => sender=\(sender)")
+                #endif
+
+                let date: Date
+                if let d = data["createdAt"] as? Date {
+                    date = d
+                } else if let ts = data["createdAt"] as? Timestamp {
+                    date = ts.dateValue()
+                } else if
+                    let tsObj = data["createdAt"] as? NSObject,
+                    let d = tsObj.value(forKey: "dateValue") as? Date {
+                    date = d
+                } else {
+                    date = Date()
+                }
+
+                let type = (data["type"] as? String) ?? (data["text"] != nil ? "text" : "audio")
+                if type == "text" {
+                    guard let text = data["text"] as? String else { return nil }
+                    return MessageItem(id: UUID(), date: date, sender: sender, kind: .text(text))
+                } else if type == "audio" {
+                    guard
+                        let urlStr = data["audioURL"] as? String,
+                        let remoteURL = URL(string: urlStr)
+                    else { return nil }
+                    let duration = (data["duration"] as? Double) ?? 0
+                    return MessageItem(id: UUID(), date: date, sender: sender, kind: .audio(remoteURL, duration: duration))
+                } else {
+                    return nil
+                }
+            }
+            self.messages = items
+            self.isLoadingHistory = false
+        } catch {
+            self.isLoadingHistory = false
+            self.uploadError = localizedFirestoreError(error)
+        }
+    }
+
+    // 發送文字：上傳 + 簡單回覆（移除樂觀更新）
+    @MainActor
     private func sendText() async {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         uploadError = nil
+
         isUploading = true
+        text = ""
+
         do {
             try await uploader.uploadText(trimmed)
-            text = ""
             isUploading = false
-            await loadHistory()
+
+            // 重新抓歷史（確保順序/欄位與伺服器一致）
+            await loadAllMessagesForCouple()
+
+            // 顯示成功提示
+            uploadSuccessMessage = "已上傳文字訊息"
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                if uploadSuccessMessage == "已上傳文字訊息" { uploadSuccessMessage = nil }
+            }
+
+            // 產生簡單回覆（可切換）
+            if useAI {
+                let reply = await responder.reply(to: trimmed)
+                let partnerItem = MessageItem(id: UUID(), date: Date(), sender: "partner", kind: .text(reply))
+                // 僅本地顯示，不寫入 Firestore；若要寫雲端，告訴我再幫你加上
+                messages.insert(partnerItem, at: 0)
+            }
         } catch {
             isUploading = false
             uploadError = localizedFirestoreError(error)
@@ -486,7 +791,14 @@ struct MessageView: View {
             do {
                 try await uploader.uploadAudio(fileURL: result.url, duration: result.duration)
                 isUploading = false
-                await loadHistory()
+                await loadAllMessagesForCouple()
+
+                // 顯示成功提示
+                uploadSuccessMessage = "已上傳語音訊息"
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    if uploadSuccessMessage == "已上傳語音訊息" { uploadSuccessMessage = nil }
+                }
             } catch {
                 isUploading = false
                 uploadError = localizedStorageError(error)
@@ -529,79 +841,195 @@ struct MessageView: View {
         }
         return "上傳失敗，請稍後重試（\(msg)）"
     }
+
+    // 新增本地草稿
+    @MainActor
+    private func addLocalDraft() {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let draft = MessageItem(id: UUID(), date: Date(), sender: "me", kind: .text(trimmed))
+        localDrafts.insert(draft, at: 0)
+
+        // 若已開啟 AI 功能，先產生一則本地「對方」回覆（不寫雲端）
+        if useAI, case let .text(content) = draft.kind {
+            Task { @MainActor in
+                let reply = await responder.reply(to: content)
+                let partnerItem = MessageItem(id: UUID(), date: Date(), sender: "partner", kind: .text(reply))
+                messages.insert(partnerItem, at: 0)
+            }
+        }
+
+        text = ""
+    }
+
+    // 上傳最新本地草稿
+    @MainActor
+    private func uploadLatestDraft() async {
+        guard let draft = localDrafts.first else { return }
+        uploadError = nil
+        isUploading = true
+        do {
+            if case let .text(content) = draft.kind {
+                try await uploader.uploadText(content)
+            } else {
+                // 目前只支援文字草稿的上傳
+            }
+            // 上傳成功，移除草稿
+            if !localDrafts.isEmpty { localDrafts.removeFirst() }
+            isUploading = false
+            await loadAllMessagesForCouple()
+            uploadSuccessMessage = "已上傳文字訊息"
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                if uploadSuccessMessage == "已上傳文字訊息" { uploadSuccessMessage = nil }
+            }
+            if useAI, case let .text(content) = draft.kind {
+                let reply = await responder.reply(to: content)
+                let partnerItem = MessageItem(id: UUID(), date: Date(), sender: "partner", kind: .text(reply))
+                messages.insert(partnerItem, at: 0)
+            }
+        } catch {
+            isUploading = false
+            uploadError = localizedFirestoreError(error)
+        }
+    }
 }
 
-// MARK: - Row
+// MARK: - Row（左右對齊 + 對話泡泡）
 private struct MessageRow: View {
     let item: MessageItem
     @ObservedObject var player: AudioPlayer
 
+    var isMine: Bool { item.sender == "me" }
+
     var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            icon
-            content
-            Spacer()
-            Text(item.date, style: .time)
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-        }
-        .padding(.vertical, 6)
-    }
-
-    @ViewBuilder
-    private var icon: some View {
-        switch item.kind {
-        case .text:
-            Image(systemName: "text.bubble.fill")
-                .foregroundStyle(.blue)
-        case .audio:
-            Image(systemName: "waveform.circle.fill")
-                .foregroundStyle(.orange)
-        }
-    }
-
-    @ViewBuilder
-    private var content: some View {
-        switch item.kind {
-        case .text(let text):
-            Text(text)
-                .font(.body)
-                .multilineTextAlignment(.leading)
-        case .audio(let url, let duration):
-            HStack(spacing: 10) {
-                Button {
-                    if player.isPlaying {
-                        player.stop()
-                    } else {
-                        player.play(from: url)
-                    }
-                } label: {
-                    HStack(spacing: 6) {
-                        if player.isLoading {
-                            ProgressView().scaleEffect(0.8).tint(.white)
-                        } else {
-                            Image(systemName: player.isPlaying ? "stop.fill" : "play.fill")
-                        }
-                    }
-                    .font(.system(size: 16, weight: .bold))
-                    .foregroundStyle(.white)
-                    .padding(8)
-                    .background(player.isPlaying ? Color.red : Color.orange)
-                    .clipShape(Capsule())
-                }
-
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("語音訊息")
-                        .font(.subheadline)
-                    ProgressView(value: player.progress)
-                        .progressViewStyle(.linear)
-                        .frame(width: 120)
-                        .tint(.orange)
-                }
-
-                Text(timeString(duration))
-                    .font(.footnote)
+        VStack(alignment: isMine ? .trailing : .leading, spacing: 4) {
+            HStack {
+                if isMine { Spacer(minLength: 40) } // 自己訊息靠右，左側留空間
+                bubble
+                if !isMine { Spacer(minLength: 40) } // 對方訊息靠左，右側留空間
+            }
+            HStack {
+                if isMine { Spacer() }
+                Text(item.date.formatted(.dateTime.month(.twoDigits).day(.twoDigits).hour(.twoDigits(amPM: .omitted)).minute(.twoDigits)))
+                    .font(.caption2)
                     .foregroundStyle(.secondary)
+                if !isMine { Spacer() }
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    @ViewBuilder
+    private var bubble: some View {
+        if isMine {
+            switch item.kind {
+            case .text(let text):
+                Text(text)
+                    .font(.body)
+                    .multilineTextAlignment(.leading)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(Color.blue)
+                    .foregroundStyle(.white)
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .stroke(Color.blue.opacity(0.0), lineWidth: 1)
+                    )
+                    .frame(
+                        maxWidth: UIScreen.main.bounds.width * 0.7,
+                        alignment: .trailing
+                    )
+
+            case .audio(let url, let duration):
+                HStack(spacing: 10) {
+                    Button {
+                        if player.isPlaying {
+                            player.stop()
+                        } else {
+                            player.play(from: url)
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            if player.isLoading {
+                                ProgressView().scaleEffect(0.8).tint(.white)
+                            } else {
+                                Image(systemName: player.isPlaying ? "stop.fill" : "play.fill")
+                            }
+                        }
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundStyle(.white)
+                        .padding(8)
+                        .background(Color.white.opacity(0.18))
+                        .clipShape(Capsule())
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("語音訊息")
+                            .font(.subheadline)
+                            .foregroundStyle(.white)
+                        ProgressView(value: player.progress)
+                            .progressViewStyle(.linear)
+                            .frame(width: 120)
+                            .tint(.white)
+                    }
+
+                    Text(timeString(duration))
+                        .font(.footnote)
+                        .foregroundStyle(.white.opacity(0.9))
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Color.blue)
+                .foregroundStyle(.white)
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(Color.blue.opacity(0.0), lineWidth: 1)
+                )
+                .frame(
+                    maxWidth: UIScreen.main.bounds.width * 0.7,
+                    alignment: .trailing
+                )
+            }
+        } else {
+            // Partner: 以泡泡樣式呈現文字和語音描述
+            switch item.kind {
+            case .text(let text):
+                Text(text)
+                    .font(.body)
+                    .multilineTextAlignment(.leading)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(Color.green)
+                    .foregroundStyle(.white)
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .stroke(Color.green.opacity(0.0), lineWidth: 1)
+                    )
+                    .frame(
+                        maxWidth: UIScreen.main.bounds.width * 0.7,
+                        alignment: .leading
+                    )
+            case .audio(_, let duration):
+                Text("語音訊息 \(timeString(duration))")
+                    .font(.body)
+                    .multilineTextAlignment(.leading)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(Color.green)
+                    .foregroundStyle(.white)
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .stroke(Color.green.opacity(0.0), lineWidth: 1)
+                    )
+                    .frame(
+                        maxWidth: UIScreen.main.bounds.width * 0.7,
+                        alignment: .leading
+                    )
             }
         }
     }

@@ -49,9 +49,7 @@ struct LottieView: UIViewRepresentable {
         return view
     }
 
-    func updateUIView(_ uiView: UIView, context: Context) {
-        // Optionally restart
-    }
+    func updateUIView(_ uiView: UIView, context: Context) {}
 
     func play() {
         animationView.play()
@@ -67,8 +65,14 @@ struct SoulCardView: View {
     @State private var isAnimating: Bool = false
     @State private var lottieKey: UUID = UUID()
 
+    // Flip control（採用範例風格）
+    @State private var flipped: Bool = false
+    // 動畫結束後只保留正面，避免任何重疊
+    @State private var showOnlyFront: Bool = false
+
     // Cards
     @State private var current: SoulCard?
+    @State private var pending: SoulCard? // 翻到背面時預先決定的卡
 
     // Replace with your own assets and copy to your Asset catalog
     private let cards: [SoulCard] = [
@@ -80,7 +84,12 @@ struct SoulCardView: View {
     ]
 
     // Name of your bundled Lottie JSON (add the .json file to the target)
-    private let lottieAnimationName: String = "Sparkles" // change to your file name
+    private let lottieAnimationName: String = "Sparkles"
+
+    // 外觀比例與縮放
+    private let cardAspect: CGFloat = 0.75
+    private let scaleFactor: CGFloat = 0.7
+    private let maxBaseWidth: CGFloat = 420
 
     var body: some View {
         ZStack {
@@ -89,19 +98,20 @@ struct SoulCardView: View {
                 .opacity(0.5)
 
             // 內容圖層
-            VStack(spacing: 18) {
+            VStack(spacing: 20) {
                 header
+                    .padding(.top, -120)
 
                 cardDisplay
                     .frame(maxWidth: .infinity)
                     .padding(.horizontal, 16)
 
                 drawButton
-                    .padding(.horizontal, 16)
+                    .padding(.horizontal, 50)
 
                 Spacer()
             }
-            .padding(.top, 16)
+            .padding(.top, 50)
         }
         .navigationTitle("心靈小卡")
         .navigationBarTitleDisplayMode(.inline)
@@ -109,6 +119,9 @@ struct SoulCardView: View {
             if current == nil {
                 current = cards.randomElement()
             }
+            // 進場先顯示背面（Back_2）
+            flipped = false
+            showOnlyFront = false
         }
     }
 
@@ -117,11 +130,13 @@ struct SoulCardView: View {
         VStack(spacing: 8) {
             ZStack {
                 if !reduceMotion {
-                    // Recreate Lottie view when key changes to retrigger play
-                    LottieView(animationName: lottieAnimationName, loopMode: isAnimating ? .loop : .playOnce, playOnAppear: true, speed: 1.0)
-                        .id(lottieKey)
-                        .frame(height: 120)
-                        .opacity(0.9)
+                    LottieView(animationName: lottieAnimationName,
+                               loopMode: isAnimating ? .loop : .playOnce,
+                               playOnAppear: true,
+                               speed: 1.0)
+                    .id(lottieKey)
+                    .frame(height: 120)
+                    .opacity(0.9)
                 } else {
                     Image(systemName: "sparkles")
                         .font(.system(size: 40))
@@ -132,65 +147,109 @@ struct SoulCardView: View {
             Text("抽一張給今天的自己/你們")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
+                .padding(.top, -40)
         }
     }
 
     // MARK: - Card UI
     private var cardDisplay: some View {
-        Group {
-            if let card = current {
-                VStack(spacing: 12) {
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 18, style: .continuous)
-                            .fill(LinearGradient(colors: [.purple.opacity(0.15), .pink.opacity(0.15)],
-                                                 startPoint: .topLeading, endPoint: .bottomTrailing))
-                            .shadow(color: .black.opacity(0.06), radius: 10, x: 0, y: 4)
+        GeometryReader { geo in
+            let baseWidth = min(geo.size.width, maxBaseWidth)
+            let width = baseWidth * scaleFactor
+            let height = width / max(0.01, cardAspect)
 
-                        VStack(spacing: 12) {
-                            if let imgName = card.imageName, UIImage(named: imgName) != nil {
-                                Image(imgName)
-                                    .resizable()
-                                    .scaledToFit()
-                                    .frame(height: 140)
-                                    .accessibilityHidden(true)
-                            } else {
-                                Image(systemName: "sparkles")
-                                    .font(.system(size: 56))
-                                    .foregroundStyle(.purple)
-                                    .padding(.top, 12)
-                            }
+            ZStack {
+                if showOnlyFront {
+                    // 動畫結束後：只保留正面，完全無重疊
+                    cardFrontImage
+                        .frame(width: width, height: height)
+                        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                        .shadow(color: .black.opacity(0.06), radius: 10, x: 0, y: 4)
+                } else {
+                    // 動畫進行中或背面狀態：兩面同時存在做翻面動畫
+                    cardBack
+                        .frame(width: width, height: height)
+                        .opacity(flipped ? 0 : 1)
+                        .rotation3DEffect(.degrees(flipped ? 180 : 0), axis: (x: 0, y: 1, z: 0))
 
-                            Text(card.title)
+                    cardFrontImage
+                        .frame(width: width, height: height)
+                        .opacity(flipped ? 1 : 0)
+                        .rotation3DEffect(.degrees(flipped ? 0 : -180), axis: (x: 0, y: 1, z: 0))
+                }
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { toggleFlip() }
+            .frame(maxWidth: .infinity, maxHeight: height)
+        }
+        .frame(height: (maxBaseWidth * scaleFactor) / max(0.01, cardAspect))
+    }
+
+    private var cardBack: some View {
+        Image("Back_2")
+            .resizable()
+            .scaledToFill()
+            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .shadow(color: .black.opacity(0.06), radius: 10, x: 0, y: 4)
+    }
+
+    @ViewBuilder
+    private var cardFrontImage: some View {
+        if let imgName = current?.imageName, UIImage(named: imgName) != nil {
+            Image(imgName)
+                .resizable()
+                .scaledToFill()
+                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .overlay(
+                    VStack {
+                        Spacer()
+                        if let title = current?.title {
+                            Text(title)
+                                .font(.headline)
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 8)
+                                .frame(maxWidth: .infinity, alignment: .center)
+                                .background(.black.opacity(0.35))
+                                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                                .padding(8)
+                        }
+                    }
+                )
+                .shadow(color: .black.opacity(0.06), radius: 10, x: 0, y: 4)
+        } else {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(LinearGradient(colors: [.purple.opacity(0.15), .pink.opacity(0.15)],
+                                     startPoint: .topLeading, endPoint: .bottomTrailing))
+                .overlay(
+                    VStack(spacing: 6) {
+                        Image(systemName: "sparkles")
+                            .font(.system(size: 52))
+                            .foregroundStyle(.purple)
+                        if let title = current?.title {
+                            Text(title)
                                 .font(.title3.bold())
-
-                            Text(card.detail)
+                                .multilineTextAlignment(.center)
+                        }
+                        if let detail = current?.detail {
+                            Text(detail)
                                 .font(.body)
                                 .foregroundStyle(.secondary)
                                 .multilineTextAlignment(.center)
                                 .padding(.horizontal, 16)
-
-                            Spacer(minLength: 4)
                         }
-                        .padding(16)
                     }
-                    .frame(height: 260)
-                    // 修正 transition：使用 AnyTransition.scale 與 opacity 組合，提升相容性
-                    .transition(.asymmetric(insertion: AnyTransition.scale.combined(with: .opacity),
-                                            removal: .opacity))
-                }
-            } else {
-                Text("點擊下方按鈕抽卡")
-                    .foregroundStyle(.secondary)
-                    .frame(height: 200)
-            }
+                    .padding(16)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                )
+                .shadow(color: .black.opacity(0.06), radius: 10, x: 0, y: 4)
         }
-        .animation(.spring(response: 0.5, dampingFraction: 0.8), value: current)
     }
 
     // MARK: - Draw Button
     private var drawButton: some View {
         Button {
-            drawCard()
+            toggleFlip()
         } label: {
             HStack(spacing: 8) {
                 Image(systemName: "wand.and.stars")
@@ -209,19 +268,52 @@ struct SoulCardView: View {
     }
 
     // MARK: - Actions
-    private func drawCard() {
-        // Trigger Lottie replay
+    private func toggleFlip() {
+        // 播 Lottie
         if !reduceMotion {
             isAnimating = true
-            lottieKey = UUID() // force recreate to replay
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            lottieKey = UUID()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                 isAnimating = false
             }
         }
 
-        // Randomize card
-        withAnimation {
-            current = cards.randomElement()
+        let duration = reduceMotion ? 0.18 : 0.5
+
+        // 若目前是正面且只顯示正面，要翻回背面時，先恢復雙面模式
+        if flipped && showOnlyFront {
+            showOnlyFront = false
+        }
+
+        // 在翻面開始時，就先決定好下一張卡（等半程背面可視時替換）
+        if !flipped {
+            // 正要從背面翻到正面 → 抽一張準備顯示
+            pending = cards.randomElement()
+        } else {
+            // 正要從正面翻回背面 → 可選擇不預抽，或預抽下一輪
+            pending = cards.randomElement()
+        }
+
+        // 翻面動畫
+        withAnimation(.easeInOut(duration: duration)) {
+            flipped.toggle()
+        }
+
+        // 半程（約背面可視時刻）替換 current，這樣回到正面時已是新卡
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration / 2) {
+            if let p = pending {
+                current = p
+                pending = nil
+            }
+        }
+
+        // 動畫結束後：若停在正面，只顯示正面；若停在背面，維持雙面模式
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration) {
+            if flipped {
+                showOnlyFront = true
+            } else {
+                showOnlyFront = false
+            }
         }
     }
 }

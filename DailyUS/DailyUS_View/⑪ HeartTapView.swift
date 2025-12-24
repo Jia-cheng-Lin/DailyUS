@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import DotLottie
 
 struct HeartTapView: View {
     // Persist total taps across launches
@@ -109,14 +110,7 @@ struct HeartTapView: View {
             if let celebration {
                 CelebrationOverlay(celebration: celebration)
                     .transition(.opacity)
-                    .onAppear {
-                        // Auto dismiss after a moment
-                        DispatchQueue.main.asyncAfter(deadline: .now() + celebration.duration) {
-                            withAnimation(.easeOut(duration: 0.35)) {
-                                self.celebration = nil
-                            }
-                        }
-                    }
+                    // 移除自動關閉，改成只在點擊時關閉
                     .onTapGesture {
                         withAnimation(.easeOut(duration: 0.3)) {
                             self.celebration = nil
@@ -165,7 +159,7 @@ struct HeartTapView: View {
         // Compute scaling based on amount (log keeps it reasonable)
         // amount: 1 -> ~1.18, 10 -> ~1.26, 100 -> ~1.34, 1000 -> ~1.42 (before spring settles back)
         let basePop: CGFloat = 1.88
-        let scaleBoostPerDecade: CGFloat = 0.80
+        let scaleBoostPerDecade: CGFloat = 0.08
         let decades = CGFloat(max(0, Int(log10(Double(max(1, amount)))))) // 1->0,10->1,100->2,1000->3
         let targetScale = basePop + scaleBoostPerDecade * decades
 
@@ -178,12 +172,11 @@ struct HeartTapView: View {
         }
 
         // Burst hearts: count and size scale with amount
-        // Spawn more hearts for larger amounts, but cap to avoid overload
         let baseCount = 3
         let extraPerDecade = 3
         let spawnCount = min(18, baseCount + Int(decades) * extraPerDecade)
 
-        // Size multiplier for burst hearts: grow slightly with amount
+        // Size multiplier for burst hearts
         let baseSizeMul: CGFloat = 1.0
         let sizeMul = baseSizeMul + 0.25 * decades
 
@@ -205,12 +198,12 @@ struct HeartTapView: View {
     }
 
     private func checkMilestoneTrigger(previous: Int, current: Int) {
-        // Trigger only if we just reached or crossed a milestone (not re-trigger on every tap)
-        let milestones: [Int] = [100, 520, 1118, 1314] // include all you want
-        guard let reached = milestones.first(where: { previous < $0 && current >= $0 }) else { return }
+        // 只在「剛好等於」里程碑時觸發
+        let milestones: [Int] = [100, 520, 1118, 1314, 10000]
+        guard milestones.contains(current) else { return }
 
         let mode: Celebration.Mode
-        switch reached {
+        switch current {
         case 100:
             mode = .confetti(message: "100！好棒！", accent: .mint)
         case 520:
@@ -219,8 +212,10 @@ struct HeartTapView: View {
             mode = .hearts(message: "1118 紀念日快樂 ✨", accent: .yellow)
         case 1314:
             mode = .hearts(message: "1314 一生一世 💖", accent: .red)
+        case 10000:
+            mode = .hearts(message: "10000 愛你一萬年 😍", accent: .orange)
         default:
-            mode = .confetti(message: "恭喜達成 \(reached)！", accent: .blue)
+            mode = .confetti(message: "恭喜達成 \(current)！", accent: .blue)
         }
 
         withAnimation(.easeIn(duration: 0.25)) {
@@ -249,10 +244,9 @@ private struct BurstHeart: View {
             .scaleEffect(scale)
             .opacity(opacity)
             .onAppear {
-                // Random direction and distance
                 let angle = Double.random(in: 0...(2 * .pi))
                 let baseDistance = CGFloat.random(in: 40...90)
-                let distance = baseDistance * (0.9 + 0.4 * sizeMultiplier) // go farther if bigger
+                let distance = baseDistance * (0.9 + 0.4 * sizeMultiplier)
                 let dx = cos(angle) * distance
                 let dy = sin(angle) * distance * 0.8
 
@@ -294,13 +288,13 @@ private struct CelebrationOverlay: View {
 
     var body: some View {
         ZStack {
-            // Dim background
+            // 全螢幕半透明背景
             Rectangle()
                 .fill(.black.opacity(0.35))
                 .ignoresSafeArea()
                 .opacity(appear ? 1 : 0)
 
-            // Animated particles
+            // 可選：背景粒子（如需完全只顯示動畫，可移除此層）
             ZStack {
                 ForEach(particles) { p in
                     symbol(for: celebration.mode)
@@ -315,32 +309,82 @@ private struct CelebrationOverlay: View {
             }
             .allowsHitTesting(false)
 
-            // Center message badge
-            VStack(spacing: 12) {
-                switch celebration.mode {
-                case .hearts(let message, let accent),
-                     .confetti(let message, let accent):
-                    Text(message)
-                        .font(.system(size: 28, weight: .bold, design: .rounded))
-                        .padding(.horizontal, 22)
-                        .padding(.vertical, 12)
-                        .background(.ultraThinMaterial)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                .stroke(accent.opacity(0.7), lineWidth: 2)
-                        )
-                        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                        .shadow(radius: 10)
-                        .scaleEffect(appear ? 1 : 0.85)
-                        .opacity(appear ? 1 : 0)
-                }
-            }
+            // 中央全螢幕動畫 + 文字（VStack，動畫優先）
+            centerContent()
+                .opacity(appear ? 1 : 0)
         }
         .onAppear {
             withAnimation(.easeOut(duration: 0.2)) { appear = true }
-            // reset particles each time
             particles = (0..<28).map { _ in Particle(mode: celebration.mode) }
         }
+    }
+
+    // 依 case 指定動畫檔名；動畫鋪滿全螢幕並 loop，直到點擊關閉
+    @ViewBuilder
+    private func centerContent() -> some View {
+        switch celebration.mode {
+        case .hearts(let message, let accent):
+            VStack(spacing: 16) {
+                // 依你專案中的檔名：520 / 1118 / 1314 / 10000
+                let file = heartsAnimationFileName(from: message)
+                DotLottieAnimation(fileName: file,
+                                   bundle: .main,
+                                   config: AnimationConfig(autoplay: true, loop: true))
+                    .view()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .ignoresSafeArea()
+
+                // 讓文字往上一點
+                Text(message)
+                    .font(.system(size: 28, weight: .bold, design: .rounded))
+                    .padding(.horizontal, 22)
+                    .padding(.vertical, 12)
+                    .background(.ultraThinMaterial)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .stroke(accent.opacity(0.7), lineWidth: 2)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .shadow(radius: 10)
+                    .padding(.top, -150)
+            }
+
+        case .confetti(let message, let accent):
+            VStack(spacing: 16) {
+                // 如果訊息包含 "100"（100！好棒！），改播 "100" 這支動畫，否則使用預設 "confetti"
+                let confettiFile = message.contains("100") ? "100" : "confetti"
+                DotLottieAnimation(fileName: confettiFile,
+                                   bundle: .main,
+                                   config: AnimationConfig(autoplay: true, loop: true))
+                    .view()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .ignoresSafeArea()
+
+                // 讓文字往上一點
+                Text(message)
+                    .font(.system(size: 28, weight: .bold, design: .rounded))
+                    .padding(.horizontal, 22)
+                    .padding(.vertical, 12)
+                    .background(.ultraThinMaterial)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .stroke(accent.opacity(0.7), lineWidth: 2)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .shadow(radius: 10)
+                    .padding(.top, -150)
+            }
+        }
+    }
+
+    // 從訊息字串辨識對應的 hearts 動畫檔名（依你的命名規則）
+    private func heartsAnimationFileName(from message: String) -> String {
+        if message.contains("520") { return "520" }
+        if message.contains("1118") { return "1118" }
+        if message.contains("1314") { return "1314" }
+        if message.contains("10000") { return "10000" }
+        // 預設回退
+        return "hearts"
     }
 
     @ViewBuilder
@@ -380,7 +424,6 @@ private struct CelebrationOverlay: View {
         var scale: CGFloat = 0.9
 
         init(mode: Celebration.Mode? = nil) {
-            // color palette per mode
             let palette: [Color]
             switch mode {
             case .hearts(_, let accent):
